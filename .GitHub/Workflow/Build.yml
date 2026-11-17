@@ -1,0 +1,129 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Proje dosyalari
+        run: |
+          mkdir -p app/www && cd app
+          cat > package.json <<'EOF_PKG'
+          {"name":"vrbox-ar","version":"1.0.0","private":true,
+          "dependencies":{"@capacitor/core":"6.1.2","@capacitor/android":"6.1.2"},
+          "devDependencies":{"@capacitor/cli":"6.1.2"}}
+          EOF_PKG
+          cat > capacitor.config.json <<'EOF_CFG'
+          {"appId":"com.vrbox.handar","appName":"VR Box AR","webDir":"www","android":{"allowMixedContent":false}}
+          EOF_CFG
+          cat > www/index.html <<'EOF_HTML'
+          <!doctype html><html lang="tr"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+          <title>VR Box AR</title>
+          <style>
+          html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#fff;touch-action:none}
+          canvas{position:fixed;inset:0;width:100%;height:100%;display:none}
+          #ov{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#0b0f1a;text-align:center;padding:20px}
+          button{font-size:20px;padding:14px 34px;border:0;border-radius:30px;background:#4f8cff;color:#fff}
+          #st{font-size:14px;opacity:.8;max-width:80%}
+          </style></head><body>
+          <div id="ov"><h2>VR Box AR</h2><div>Telefonu yatay tutup VR kutusuna tak.<br>El takibi: işaret + başparmak birleştir = tıkla.</div><button id="go">Başlat</button><div id="st"></div></div>
+          <canvas id="c"></canvas><video id="v" playsinline muted autoplay style="display:none"></video>
+          <script type="module">
+          const $=id=>document.getElementById(id),cv=$('c'),v=$('v'),st=$('st');
+          const ctx=cv.getContext('2d',{alpha:false,desynchronized:true});
+          let S={ipd:0,fov:70,size:1,stereo:true};
+          try{Object.assign(S,JSON.parse(localStorage.getItem('vrs')||'{}'))}catch(e){}
+          const save=()=>{try{localStorage.setItem('vrs',JSON.stringify(S))}catch(e){}};
+          // ---- Jiroskop ----
+          const D=Math.PI/180;let q=[0,0,0,1],have=false,yaw0=0;
+          const qm=(a,b)=>[a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1],a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0],a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3],a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2]];
+          function onOri(e){if(e.alpha==null)return;have=true;
+           const x=(e.beta||0)*D,y=e.alpha*D,z=-(e.gamma||0)*D,c1=Math.cos(x/2),c2=Math.cos(y/2),c3=Math.cos(z/2),s1=Math.sin(x/2),s2=Math.sin(y/2),s3=Math.sin(z/2);
+           let r=[s1*c2*c3+c1*s2*s3,c1*s2*c3-s1*c2*s3,c1*c2*s3-s1*s2*c3,c1*c2*c3+s1*s2*s3];
+           r=qm(r,[-Math.SQRT1_2,0,0,Math.SQRT1_2]);
+           const o=-((screen.orientation&&screen.orientation.angle)||window.orientation||0)*D;
+           q=qm(r,[0,0,Math.sin(o/2),Math.cos(o/2)]);}
+          const rot=(p,d)=>{const c=[-q[0],-q[1],-q[2],q[3]];const t=qm(qm(c,[d[0],d[1],d[2],0]),q.map((x,i)=>i<3?x:x).map((x,i)=>x));return t};
+          function toCam(d){const c=[-q[0],-q[1],-q[2],q[3]],a=qm(c,[d[0],d[1],d[2],0]);const r=qm(a,q);return r}
+          function fwdYaw(){const a=qm(qm(q,[0,0,-1,0]),[-q[0],-q[1],-q[2],q[3]]);return Math.atan2(a[0],-a[2])}
+          // ---- Menü ----
+          let page='home',clock='';
+          const HOME=[['Saat',()=>{},-40,12],['Not',()=>{},-20,12],['Ayarlar',()=>page='set',0,12],['Ortala',()=>yaw0=fwdYaw(),20,12],['Böl: Aç/Kapa',()=>{S.stereo=!S.stereo;save()},40,12]];
+          const clamp=(a,l,h)=>Math.min(h,Math.max(l,a));
+          const SET=[['IPD -',()=>{S.ipd=clamp(S.ipd-4,-120,120)},-45,18],['IPD +',()=>{S.ipd=clamp(S.ipd+4,-120,120)},-15,18],['FOV -',()=>{S.fov=clamp(S.fov-5,40,110)},15,18],['FOV +',()=>{S.fov=clamp(S.fov+5,40,110)},45,18],
+          ['Boyut -',()=>{S.size=clamp(S.size-.1,.5,2)},-45,-2],['Boyut +',()=>{S.size=clamp(S.size+.1,.5,2)},-15,-2],['Geri',()=>page='home',15,-2]];
+          // ---- El takibi ----
+          let hand=null,pinchPrev=false,click=false,lm=null,cur={x:0,y:0,on:false};
+          let lastT=-1,hl=null;
+          async function initHands(){try{
+           const m=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+           const f=await m.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+           hl=await m.HandLandmarker.createFromOptions(f,{baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},runningMode:'VIDEO',numHands:1});
+           st.textContent='El takibi hazır';}catch(e){hl=null;console.error(e)}}
+          function track(){if(!hl||v.readyState<2||v.currentTime===lastT)return;lastT=v.currentTime;
+           try{const r=hl.detectForVideo(v,performance.now());lm=r.landmarks&&r.landmarks[0]||null}catch(e){lm=null}
+           if(!lm){cur.on=false;pinchPrev=false;click=false;return}
+           const a=lm[8],b=lm[4],sz=Math.hypot(lm[0].x-lm[9].x,lm[0].y-lm[9].y)||.1;
+           const pinch=Math.hypot(a.x-b.x,a.y-b.y)/sz<.35;
+           const nx=(a.x+b.x)/2*0+a.x,ny=a.y;
+           cur.x=cur.on?cur.x+(nx-cur.x)*.6:nx;cur.y=cur.on?cur.y+(ny-cur.y)*.6:ny;cur.on=true;
+           click=pinch&&!pinchPrev;pinchPrev=pinch;cur.pinch=pinch}
+          // ---- Çizim ----
+          let W,H;function resize(){const r=devicePixelRatio||1;cv.width=W=Math.round(innerWidth*r);cv.height=H=Math.round(innerHeight*r)}
+          addEventListener('resize',resize);
+          function vidRect(ew,eh){const vw=v.videoWidth||16,vh=v.videoHeight||9,k=Math.max(ew/vw,eh/vh);return{w:vw*k,h:vh*k}}
+          const rr=(x,y,w,h,r)=>{ctx.beginPath();ctx.roundRect?ctx.roundRect(x,y,w,h,r):ctx.rect(x,y,w,h)};
+          let hit=null,hover=-1;
+          function layout(ew,eh,items){const f=(eh/2)/Math.tan(S.fov*D/2),out=[];
+           const base=fwdYaw?yaw0:0;
+           items.forEach((it,i)=>{const yw=it[2]*D+base,p=it[3]*D,d=[Math.sin(yw)*Math.cos(p),Math.sin(p),-Math.cos(yw)*Math.cos(p)],c=toCam(d);
+            if(c[2]>=-.05)return;const sc=f/-c[2],w=.3*S.size*sc;out.push({i,x:c[0]*sc,y:-c[1]*sc,w:w,h:w*.8,it})});return out}
+          function eye(ox,ew,eh,L,eyeIdx){ctx.save();ctx.beginPath();ctx.rect(ox,0,ew,eh);ctx.clip();
+           ctx.translate(ox+ew/2+(eyeIdx?-1:1)*S.ipd*(W/1000)*.5*(S.stereo?1:0),eh/2);
+           const vr=vidRect(ew,eh);ctx.drawImage(v,-vr.w/2,-vr.h/2,vr.w,vr.h);
+           for(const t of L){const hv=t.i===hover;ctx.globalAlpha=hv?1:.8;ctx.fillStyle=hv?'rgba(79,140,255,.9)':'rgba(20,24,40,.7)';rr(t.x-t.w/2,t.y-t.h/2,t.w,t.h,t.w*.15);ctx.fill();
+            ctx.globalAlpha=1;ctx.fillStyle='#fff';ctx.font=`${t.h*.22}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';
+            let lb=t.it[0];if(lb==='Saat')lb=clock;ctx.fillText(lb,t.x,t.y)}
+           if(page==='set'){ctx.fillStyle='#fff';ctx.font=`${eh*.04}px system-ui`;ctx.textAlign='center';ctx.fillText(`IPD ${S.ipd}  FOV ${S.fov}  Boyut ${S.size.toFixed(1)}`,0,-eh*.35)}
+           if(cur.on){const x=(cur.x-.5)*vr.w,y=(cur.y-.5)*vr.h;ctx.fillStyle=cur.pinch?'#ff4f6a':'#7dffb0';ctx.beginPath();ctx.arc(x,y,eh*.025,0,7);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=3;ctx.stroke()}
+           ctx.restore()}
+          function frame(){requestAnimationFrame(frame);track();
+           const n=new Date();clock=n.toTimeString().slice(0,5);
+           ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+           const ew=S.stereo?W/2:W,L=layout(ew,H,page==='home'?HOME:SET);
+           // etkileşim (sol göz koordinatlarında)
+           hover=-1;if(cur.on){const vr=vidRect(ew,H),cx=(cur.x-.5)*vr.w,cy=(cur.y-.5)*vr.h;
+            for(const t of L)if(Math.abs(cx-t.x)<t.w/2&&Math.abs(cy-t.y)<t.h/2){hover=t.i;break}
+            if(click&&hover>=0){const a=(page==='home'?HOME:SET)[hover];a[1]();save();navigator.vibrate&&navigator.vibrate(15)}}click=false;
+           eye(0,ew,H,L,0);if(S.stereo)eye(ew,ew,H,L,1)}
+          // ---- Başlat ----
+          $('go').onclick=async()=>{
+           try{if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission){if(await DeviceOrientationEvent.requestPermission()!=='granted')throw 'Jiroskop izni reddedildi'}
+           const s=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60}}});
+           v.srcObject=s;await v.play();
+           addEventListener('deviceorientation',onOri,true);
+           try{await document.documentElement.requestFullscreen();await screen.orientation.lock('landscape')}catch(e){}
+           try{await navigator.wakeLock.request('screen')}catch(e){}
+           $('ov').style.display='none';cv.style.display='block';resize();
+           setTimeout(()=>{yaw0=have?fwdYaw():0},600);initHands();frame();
+           }catch(e){st.textContent='Hata: '+(e.message||e)}};
+          </script></body></html>
+          EOF_HTML
+      - run: cd app && npm install
+      - run: cd app && npx cap add android
+      - name: Manifest
+        run: |
+          M=app/android/app/src/main/AndroidManifest.xml
+          sed -i 's#</manifest>#<uses-permission android:name="android.permission.CAMERA"/><uses-feature android:name="android.hardware.camera" android:required="true"/><uses-feature android:name="android.hardware.sensor.gyroscope" android:required="true"/></manifest>#' $M
+          sed -i 's#<activity#<activity android:screenOrientation="sensorLandscape"#' $M
+      - run: cd app && npx cap sync android
+      - run: cd app/android && chmod +x gradlew && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vrbox-ar-apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
+          
